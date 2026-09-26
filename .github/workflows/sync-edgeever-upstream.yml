@@ -32,6 +32,9 @@ jobs:
     name: Sync Fork and trigger deployment
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      published: ${{ steps.publish.outcome == 'success' }}
+      target_version: ${{ steps.upstream.outputs.target_version }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       UPSTREAM_REPOSITORY: tianma-if/edgeever
@@ -411,3 +414,90 @@ jobs:
               --title "${title}" \
               --body "The daily update from \`${UPSTREAM_REPOSITORY}\` (${TARGET_REF}) could not be aligned or verified. The current production deployment was left unchanged. Open the failed **Update deployed EdgeEver** workflow run for details (see the job summary for channel/target/reason), then retry it manually after resolving the problem."
           fi
+
+  # Deploys the Worker directly with Wrangler after a successful publish (or on
+  # any manual run), so production does not depend on the Cloudflare Workers
+  # Builds GitHub App. GITHUB_TOKEN pushes never trigger other workflows, so the
+  # deploy must live in this workflow as a dependent job.
+  deploy:
+    name: Deploy Worker with Wrangler
+    needs: update
+    if: >-
+      always() &&
+      github.repository != 'tianma-if/edgeever' &&
+      needs.update.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || needs.update.outputs.published == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    concurrency:
+      group: edgeever-worker-deploy
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # Bind to the EXISTING production resources. Never let the deploy
+      # resolve or create a different D1 database.
+      EDGE_EVER_WORKER_NAME: edgeever
+      EDGE_EVER_D1_DATABASE_NAME: edgeever
+      EDGE_EVER_D1_DATABASE_ID: ${{ vars.EDGE_EVER_D1_DATABASE_ID || 'a939bc29-da6e-4f73-8f6c-aaf688ee94d3' }}
+      EDGE_EVER_R2_BUCKET_NAME: edgeever-resources
+      # Runtime vars mirrored from the live Worker so wrangler deploy keeps them.
+      EDGE_EVER_AUTH_USERNAME: admin
+      EDGE_EVER_SESSION_TTL_DAYS: "400"
+      EDGE_EVER_AUTH_LOGIN_WINDOW_SECONDS: "900"
+      EDGE_EVER_AUTH_LOGIN_USERNAME_MAX_ATTEMPTS: "5"
+      EDGE_EVER_AUTH_LOGIN_USERNAME_COOLDOWN_SECONDS: "900"
+      EDGE_EVER_AUTH_LOGIN_IP_MAX_ATTEMPTS: "30"
+      EDGE_EVER_AUTH_LOGIN_IP_COOLDOWN_SECONDS: "300"
+      EDGE_EVER_DEMO_MODE: "false"
+      # Keep the existing EDGE_EVER_AUTH_PASSWORD runtime Secret; never re-put it.
+      EDGE_EVER_USE_EXISTING_AUTH_SECRET: "true"
+      EDGE_EVER_DEPLOYMENT_URL: ${{ vars.EDGE_EVER_DEPLOYMENT_URL || 'https://note.053727.xyz' }}
+      EDGE_EVER_DEPLOYMENT_TRIGGER: ${{ github.event_name == 'workflow_dispatch' && 'manual' || 'scheduled_update' }}
+      EDGE_EVER_DEPLOYMENT_METHOD: github_actions
+
+    steps:
+      - name: Require Cloudflare credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error title=Missing Cloudflare credentials::Set repository secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID."
+            exit 1
+          fi
+
+      - name: Checkout published main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Upstream "deploy" = typecheck + web build + worker build, then
+      # D1 migrations (remote), wrangler deploy, and deployment verification.
+      - name: Build, migrate D1, deploy and verify
+        run: bun run deploy
+
+      - name: Verify live version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')"
+          actual=""
+          for attempt in 1 2 3 4 5 6; do
+            actual="$(curl -fsS "${EDGE_EVER_DEPLOYMENT_URL%/}/api/release" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("version","")).lstrip("v"))' || true)"
+            [ "${actual}" = "${expected}" ] && break
+            sleep 5
+          done
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error title=Version mismatch::Live instance reports v${actual:-unknown}; expected v${expected}."
+            exit 1
+          fi
+          echo "::notice title=Deployed::Live instance reports v${actual}."
+          echo "Live instance reports **v${actual}** at ${EDGE_EVER_DEPLOYMENT_URL}." >> "${GITHUB_STEP_SUMMARY}"
